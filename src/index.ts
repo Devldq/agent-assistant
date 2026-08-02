@@ -1,39 +1,73 @@
+/**
+ * Agent OS 入口。
+ * 当前阶段：话题内回复 + @提及解析 + 图片下载。
+ */
 import "dotenv/config";
-import { execSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { startBot } from "./im/lark.js";
+import { resolveMentions, extractResourceKeys } from "./im/message-parser.js";
+import { buildTaskCard } from "./im/card.js";
 
-const VERSION = "0.1.0";
+const appId = process.env.BOT_A_APP_ID;
+const appSecret = process.env.BOT_A_APP_SECRET;
 
-function hasCommand(cmd: string): boolean {
-  // 仅允许字母、数字、连字符、下划线、点号，防止命令注入
-  if (!/^[a-zA-Z0-9._-]+$/.test(cmd)) return false;
-  try {
-    execSync(`command -v ${cmd}`, { stdio: "ignore", shell: "/bin/sh" });
-    return true;
-  } catch {
-    return false;
-  }
+if (!appId || !appSecret) {
+  console.error("缺少 BOT_A_APP_ID / BOT_A_APP_SECRET，请检查 .env");
+  process.exit(1);
 }
 
-function check(label: string, ok: boolean, hint: string): void {
-  console.log(`  ${ok ? "✅" : "⚠️"} ${label}${ok ? "" : `  → ${hint}`}`);
-}
+console.log("Agent OS 启动，正在建立飞书长连接…");
 
-console.log(`\nAgent OS v${VERSION} — 一个人，一队 Agent\n`);
-console.log("环境自检：");
+startBot({
+  appId,
+  appSecret,
+  onMessage: async (msg, bot) => {
+    const resolved = resolveMentions(msg.text, msg.mentions);
+    console.log(
+      `[收到] chat=${msg.chatId} threadId=${msg.threadId} rootId=${msg.rootId} sender=${msg.senderOpenId}`,
+    );
+    console.log(`  原文: ${msg.text}`);
+    console.log(`  还原: ${resolved}`);
+    console.log(
+      `  mentions: ${msg.mentions.map((m) => `${m.key}=${m.name}(${m.openId})`).join(", ") || "(无)"}`,
+    );
 
-const nodeMajor = Number(process.versions.node.split(".")[0]);
-check(`Node.js ${process.versions.node}`, nodeMajor >= 22, "需要 Node 22+");
-check(
-  ".env 配置文件",
-  existsSync(".env"),
-  "复制 .env.example 为 .env 并填入飞书凭证",
-);
-check(
-  "Claude Code CLI",
-  hasCommand("claude"),
-  "接入 CLI 前需要安装；无 Anthropic 订阅可使用 DeepSeek",
-);
-check("Codex CLI", hasCommand("codex"), "后续接入 Codex 前再安装");
+    // 图片/文件下载
+    const resources = extractResourceKeys(msg.messageType, msg.rawContent);
+    for (const res of resources) {
+      try {
+        const savePath = await bot.downloadResource(
+          msg.messageId,
+          res.key,
+          res.type,
+          join("data", "downloads"),
+          res.fileName,
+        );
+        console.log(`  [下载] ${res.type} → ${savePath}`);
+      } catch (e) {
+        console.error(`  [下载失败] ${res.key}:`, (e as Error).message);
+      }
+    }
 
-console.log("\n骨架就绪。下一步：解剖 AI CLI 的两副面孔。\n");
+    // 回复（话题内回复，replyInThread=true）
+    const hasThread = !!msg.threadId || !!msg.rootId;
+    const replyId = await bot.reply(
+      msg.messageId,
+      `收到：${resolved}`,
+      hasThread,
+    );
+    console.log(`[已回] message_id=${replyId} inThread=${hasThread}`);
+
+    const cardId = await bot.replyCard(
+      msg.messageId,
+      buildTaskCard({
+        title: "Agent OS 模拟任务",
+        status: "running",
+        progress: 0,
+        detail: "正在准备任务环境",
+      }),
+      hasThread,
+    );
+    console.log(`[卡片] 已发送 message_id=${cardId} inThread=${hasThread}`);
+  },
+});
