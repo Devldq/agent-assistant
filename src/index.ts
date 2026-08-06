@@ -21,7 +21,23 @@ if (!appId || !appSecret) {
 console.log("Agent OS 启动，正在建立飞书长连接…");
 const sessions = new SessionManager();
 
-const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const activeRuns = new Map<string, AbortController>();
+
+function wait(ms: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", stopWaiting);
+      resolve(true);
+    }, ms);
+    const stopWaiting = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    signal.addEventListener("abort", stopWaiting, { once: true });
+  });
+}
 
 const DEMO_STEPS = [
   "读取项目结构",
@@ -34,12 +50,11 @@ const DEMO_STEPS = [
   "整理执行结果",
 ];
 
-
-
 async function runCardDemo(
   bot: Bot,
   cardId: string,
   resolved: string,
+  signal: AbortSignal,
 ): Promise<void> {
   const activities: string[] = [];
   const updater = new ThrottledCardUpdater(async (card) => {
@@ -48,7 +63,11 @@ async function runCardDemo(
   });
 
   for (const [index, step] of DEMO_STEPS.entries()) {
-    await wait(700);
+    if (!(await wait(700, signal))) {
+      await updater.cancel();
+      console.log("[卡片] 任务已取消");
+      return;
+    }
     activities.push(step);
     const progress = Math.round(((index + 1) / DEMO_STEPS.length) * 90);
     console.log(`[进度] ${progress}% ${step}`);
@@ -98,7 +117,6 @@ function markSessionIdle(sessionId: string): void {
   console.log(`[会话] id=${sessionId} status=idle`);
 }
 
-
 startBot({
   appId,
   appSecret,
@@ -120,7 +138,6 @@ startBot({
       `  [会话] ${isNew ? "新建" : "复用"} id=${session.id} status=${session.status}`,
     );
 
-
     const command = parseCommand(resolved);
 
     if (command?.name === "help") {
@@ -140,7 +157,9 @@ startBot({
     }
 
     if (command?.name === "close") {
-      if (session.status !== "closed") sessions.transition(session.id, "closed");
+      activeRuns.get(session.id)?.abort();
+      if (session.status !== "closed")
+        sessions.transition(session.id, "closed");
       await bot.reply(
         msg.messageId,
         "当前会话已关闭。需要继续时，请新开一个话题。",
@@ -148,7 +167,6 @@ startBot({
       );
       return;
     }
-
     if (session.status === "closed") {
       await bot.reply(
         msg.messageId,
@@ -168,6 +186,8 @@ startBot({
     }
 
     sessions.transition(session.id, "active");
+    const run = new AbortController();
+    activeRuns.set(session.id, run);
 
     // 图片/文件下载
     const resources = extractResourceKeys(msg.messageType, msg.rawContent);
@@ -197,8 +217,10 @@ startBot({
         }),
         hasThread,
       );
+      if (activeRuns.get(session.id) === run) activeRuns.delete(session.id);
     } catch (error) {
       markSessionIdle(session.id);
+      if (activeRuns.get(session.id) === run) activeRuns.delete(session.id);
       throw error;
     }
 
@@ -211,11 +233,12 @@ startBot({
     console.log(`[卡片] 已发送 message_id=${cardId} inThread=${hasThread}`);
 
     // 让事件回调尽快返回，后续模拟更新在后台继续。
-    void runCardDemo(bot, cardId, resolved)
+    void runCardDemo(bot, cardId, resolved, run.signal)
       .catch((error) => {
         console.error("[卡片] 演示失败:", (error as Error).message);
       })
       .finally(() => {
+        if (activeRuns.get(session.id) === run) activeRuns.delete(session.id);
         markSessionIdle(session.id);
       });
   },

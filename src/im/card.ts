@@ -83,7 +83,7 @@ export class ThrottledCardUpdater {
   constructor(
     private readonly updateCard: UpdateCard,
     private readonly intervalMs = 2_000,
-  ) { }
+  ) {}
 
   push(card: CardJson): void {
     if (this.closed) throw new Error("卡片更新器已经结束");
@@ -99,6 +99,15 @@ export class ThrottledCardUpdater {
     this.pendingCard = undefined;
     await this.updateChain;
     await this.updateCard(finalCard);
+  }
+
+  async cancel(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    this.pendingCard = undefined;
+    await this.updateChain;
   }
 
   private schedule(): void {
