@@ -9,6 +9,7 @@ import { buildTaskCard, ThrottledCardUpdater } from "./im/card.js";
 import { resolveMentions, extractResourceKeys } from "./im/message-parser.js";
 import { SessionManager, type Session } from "./core/session-manager.js";
 import { parseCommand } from "./core/command-parser.js";
+import { JsonSessionStore } from "./core/session-store.js";
 
 const appId = process.env.BOT_A_APP_ID;
 const appSecret = process.env.BOT_A_APP_SECRET;
@@ -19,7 +20,10 @@ if (!appId || !appSecret) {
 }
 
 console.log("Agent OS 启动，正在建立飞书长连接…");
-const sessions = new SessionManager();
+const sessions = await SessionManager.open({
+  store: new JsonSessionStore(join("data", "sessions.json")),
+});
+console.log(`[会话] 已恢复 ${sessions.size} 个会话`);
 
 const activeRuns = new Map<string, AbortController>();
 
@@ -124,7 +128,7 @@ startBot({
     const resolved = resolveMentions(msg.text, msg.mentions);
     // 先回复一张卡片，后续更新复用同一个 message_id。
     const hasThread = !!msg.threadId || !!msg.rootId;
-    const { session, isNew } = sessions.resolve(msg);
+    const { session, isNew } = await sessions.resolve(msg);
 
     console.log(
       `[收到] chat=${msg.chatId} threadId=${msg.threadId} rootId=${msg.rootId} sender=${msg.senderOpenId}`,
@@ -173,6 +177,11 @@ startBot({
         "这个话题的会话已经关闭，请新开一个话题继续。",
         hasThread,
       );
+      return;
+    }
+
+    if (!isNew && session.status === "creating") {
+      await bot.reply(msg.messageId, "当前会话正在准备，请稍后再追问。", hasThread);
       return;
     }
 
@@ -237,9 +246,13 @@ startBot({
       .catch((error) => {
         console.error("[卡片] 演示失败:", (error as Error).message);
       })
-      .finally(() => {
+      .finally(async () => {
         if (activeRuns.get(session.id) === run) activeRuns.delete(session.id);
-        markSessionIdle(session.id);
+        try {
+          await markSessionIdle(session.id);
+        } catch (error) {
+          console.error('[会话] 保存空闲状态失败:', (error as Error).message);
+        }
       });
   },
 });

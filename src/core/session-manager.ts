@@ -1,5 +1,14 @@
 import { randomUUID } from "node:crypto";
 
+import type { SessionStore } from "./session-store.js";
+
+export interface SessionManagerOptions {
+    now?: () => Date;
+    createId?: () => string;
+    store?: SessionStore;
+}
+
+
 export type CliId = "claude";
 
 export type SessionStatus = "creating" | "active" | "idle" | "closed";
@@ -51,15 +60,27 @@ export class SessionManager {
     private readonly sessions = new Map<string, Session>();
     private readonly now: () => Date;
     private readonly createId: () => string;
+    private readonly store?: SessionStore;
 
     constructor(options: SessionManagerOptions = {}) {
         this.now = options.now ?? (() => new Date());
         this.createId = options.createId ?? randomUUID;
+        this.store = options.store;
     }
 
     get size(): number {
         return this.sessions.size;
     }
+
+    static async open(options: SessionManagerOptions = {}): Promise<SessionManager> {
+        const manager = new SessionManager(options);
+        const restored = await options.store?.load() ?? [];
+        for (const session of restored) {
+            manager.sessions.set(sessionKey(session.chatId, session.threadId), session);
+        }
+        return manager;
+    }
+
 
     get(sessionId: string): Session | undefined {
         return [...this.sessions.values()].find(
@@ -67,7 +88,7 @@ export class SessionManager {
         );
     }
 
-    resolve(message: MessageAddress): ResolvedSession {
+    async resolve(message: MessageAddress): Promise<ResolvedSession> {
         const threadId = topicIdOf(message);
         const key = sessionKey(message.chatId, threadId);
         const existing = this.sessions.get(key);
@@ -84,10 +105,16 @@ export class SessionManager {
             updatedAt: now,
         };
         this.sessions.set(key, session);
+        try {
+            await this.persist();
+        } catch (error) {
+            if (this.sessions.get(key) === session) this.sessions.delete(key);
+            throw error;
+        }
         return { session, isNew: true };
     }
 
-    transition(sessionId: string, nextStatus: SessionStatus): Session {
+    async transition(sessionId: string, nextStatus: SessionStatus): Promise<Session> {
         const current = this.get(sessionId);
         if (!current) throw new Error(`会话不存在: ${sessionId}`);
         if (!ALLOWED_TRANSITIONS[current.status].includes(nextStatus)) {
@@ -99,7 +126,18 @@ export class SessionManager {
             status: nextStatus,
             updatedAt: this.now().toISOString(),
         };
-        this.sessions.set(sessionKey(updated.chatId, updated.threadId), updated);
+        const key = sessionKey(updated.chatId, updated.threadId);
+        this.sessions.set(key, updated);
+        try {
+            await this.persist();
+        } catch (error) {
+            if (this.sessions.get(key) === updated) this.sessions.set(key, current);
+            throw error;
+        }
         return updated;
     }
+    private async persist(): Promise<void> {
+        await this.store?.save([...this.sessions.values()]);
+    }
+
 }
